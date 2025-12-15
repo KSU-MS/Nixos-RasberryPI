@@ -1,0 +1,15 @@
+[project]
+name = "ksums-data-offload-backend"
+version = "0.1.0"
+description = "KSUMS Data Offload Backend for MCAP file management"
+requires-python = ">=3.10"
+
+dependencies = [
+    "django>=4.2",
+    "djangorestframework>=3.14",
+    "django-cors-headers>=4.0",
+    "gunicorn>=21.0",
+]
+
+[project.scripts]
+data-offload-manage = "manage:main"
