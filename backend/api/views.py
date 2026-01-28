@@ -1,178 +1,210 @@
+"""
+API views for KSUMS Data Offload Backend.
+Handles listing MCAP files and recovering them via mcap-cli.
+"""
+
 import os
+import shutil
 import subprocess
-import hashlib
+import tempfile
+import zipfile
+import uuid
+import logging
 from pathlib import Path
 from datetime import datetime
 
 from django.conf import settings
-from rest_framework import viewsets, status
-from rest_framework.decorators import api_view, action
+from django.http import HttpResponse
+from rest_framework.decorators import api_view
 from rest_framework.response import Response
+from rest_framework import status
 
-from .models import MCAPFile, SyncLog
-from .serializers import MCAPFileSerializer, SyncLogSerializer
-
-
-class MCAPFileViewSet(viewsets.ModelViewSet):
-    """ViewSet for MCAP files."""
-    queryset = MCAPFile.objects.all()
-    serializer_class = MCAPFileSerializer
-
-    @action(detail=False, methods=['get'])
-    def scan(self, request):
-        """Scan recordings directory and update database."""
-        recordings_dir = Path(settings.RECORDINGS_DIR)
-        
-        if not recordings_dir.exists():
-            return Response(
-                {'error': f'Recordings directory not found: {recordings_dir}'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        found_files = []
-        for mcap_file in recordings_dir.glob('**/*.mcap'):
-            stat = mcap_file.stat()
-            
-            # Check if file already exists in DB
-            db_file, created = MCAPFile.objects.update_or_create(
-                filepath=str(mcap_file),
-                defaults={
-                    'filename': mcap_file.name,
-                    'filesize': stat.st_size,
-                }
-            )
-            found_files.append({
-                'filename': mcap_file.name,
-                'filepath': str(mcap_file),
-                'filesize': stat.st_size,
-                'created': created,
-            })
-        
-        return Response({
-            'scanned': len(found_files),
-            'files': found_files,
-        })
-
-    @action(detail=True, methods=['get'])
-    def info(self, request, pk=None):
-        """Get MCAP file info using mcap-cli."""
-        mcap_file = self.get_object()
-        
-        try:
-            result = subprocess.run(
-                ['mcap', 'info', mcap_file.filepath],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if result.returncode == 0:
-                return Response({
-                    'filename': mcap_file.filename,
-                    'info': result.stdout,
-                })
-            else:
-                return Response(
-                    {'error': result.stderr},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-        except FileNotFoundError:
-            return Response(
-                {'error': 'mcap-cli not found'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-        except subprocess.TimeoutExpired:
-            return Response(
-                {'error': 'mcap info timed out'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-
-class SyncLogViewSet(viewsets.ReadOnlyModelViewSet):
-    """ViewSet for sync logs."""
-    queryset = SyncLog.objects.all()
-    serializer_class = SyncLogSerializer
+logger = logging.getLogger(__name__)
 
 
 @api_view(['GET'])
 def health_check(request):
-    """Health check endpoint."""
+    """Health check endpoint for monitoring."""
     return Response({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'recordings_dir': settings.RECORDINGS_DIR,
-        'logs_dir': settings.LOGS_DIR,
+        "status": "healthy",
+        "service": "ksums-data-offload",
+        "timestamp": datetime.now().isoformat()
     })
 
 
 @api_view(['GET'])
-def stats(request):
-    """Get system stats."""
-    recordings_dir = Path(settings.RECORDINGS_DIR)
-    backup_dir = Path(settings.BACKUP_DIR)
+def list_files(request):
+    """
+    List all .mcap files in the configured RECORDINGS_BASE_DIR.
+    """
+    base_dir = Path(settings.RECORDINGS_BASE_DIR)
     
-    recordings_count = 0
-    recordings_size = 0
-    backup_count = 0
-    backup_size = 0
-    
-    if recordings_dir.exists():
-        for f in recordings_dir.glob('**/*.mcap'):
-            recordings_count += 1
-            recordings_size += f.stat().st_size
-    
-    if backup_dir.exists():
-        for f in backup_dir.glob('**/*.mcap'):
-            backup_count += 1
-            backup_size += f.stat().st_size
-    
+    if not base_dir.exists():
+        logger.warning(f"Recordings directory does not exist: {base_dir}")
+        return Response({
+            "error": f"Directory {base_dir} does not exist"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    files_data = []
+    try:
+        for entry in os.scandir(base_dir):
+            if entry.is_file() and entry.name.endswith('.mcap'):
+                stat = entry.stat()
+                files_data.append({
+                    "name": entry.name,
+                    "size": stat.st_size,
+                    "createdAt": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                    "modifiedAt": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                })
+        
+        # Sort by modified date, newest first
+        files_data.sort(key=lambda x: x['modifiedAt'], reverse=True)
+        
+        logger.info(f"Listed {len(files_data)} MCAP files from {base_dir}")
+        
+    except Exception as e:
+        logger.error(f"Error listing files: {e}")
+        return Response({
+            "error": str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     return Response({
-        'recordings': {
-            'count': recordings_count,
-            'size_bytes': recordings_size,
-            'size_human': _human_readable_size(recordings_size),
-        },
-        'backup': {
-            'count': backup_count,
-            'size_bytes': backup_size,
-            'size_human': _human_readable_size(backup_size),
-        },
-        'database': {
-            'mcap_files': MCAPFile.objects.count(),
-            'sync_logs': SyncLog.objects.count(),
-        }
+        "dir": str(base_dir),
+        "files": files_data,
+        "count": len(files_data)
     })
 
 
+def resolve_inside(base, rel):
+    """
+    Safely resolve a relative path inside a base directory.
+    Prevents path traversal attacks.
+    """
+    base_abs = Path(base).resolve()
+    target_abs = (base_abs / rel).resolve()
+    if base_abs not in target_abs.parents and base_abs != target_abs:
+        raise ValueError("Path traversal detected")
+    return target_abs
+
+
 @api_view(['POST'])
-def trigger_sync(request):
-    """Manually trigger a sync operation."""
+def recover_and_zip(request):
+    """
+    Take a list of filenames, run 'mcap recover' on each,
+    zip the results, and return the zip file.
+    """
+    files = request.data.get('files', [])
+    if not files or not isinstance(files, list):
+        return Response({
+            "error": "Expected { files: string[] }"
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    base_dir = Path(settings.RECORDINGS_BASE_DIR)
+    
+    if not base_dir.exists():
+        return Response({
+            "error": f"Recordings directory does not exist: {base_dir}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # Create temp workspace
+    job_id = str(uuid.uuid4())
+    tmp_root = Path(tempfile.gettempdir()) / f"recoverjob-{job_id}"
+    input_dir = tmp_root / "input"
+    output_dir = tmp_root / "output"
+    
     try:
-        result = subprocess.run(
-            ['systemctl', 'start', 'mcap-sync.service'],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        if result.returncode == 0:
-            return Response({'status': 'sync triggered'})
-        else:
-            return Response(
-                {'error': result.stderr},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        staged_files = []
+
+        # Stage files - copy to temp directory
+        for filename in files:
+            try:
+                src = resolve_inside(base_dir, filename)
+                if not src.exists() or not src.is_file():
+                    raise ValueError(f"File not found: {filename}")
+                dest = input_dir / Path(filename).name
+                shutil.copy2(src, dest)
+                staged_files.append(dest)
+                logger.info(f"Staged file for recovery: {filename}")
+            except Exception as e:
+                shutil.rmtree(tmp_root, ignore_errors=True)
+                logger.error(f"Error staging file {filename}: {e}")
+                return Response({
+                    "error": str(e)
+                }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Run mcap recover on each file
+        recovered_files = []
+        
+        for input_file in staged_files:
+            output_filename = input_file.stem + "-recovered" + input_file.suffix
+            output_file = output_dir / output_filename
+            
+            try:
+                # mcap recover input.mcap -o output.mcap
+                cmd = ["mcap", "recover", str(input_file), "-o", str(output_file)]
+                
+                logger.info(f"Running: {' '.join(cmd)}")
+                
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(tmp_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=300  # 5 minute timeout per file
+                )
+                
+                if proc.returncode != 0:
+                    error_msg = proc.stderr.decode('utf-8') or "Unknown error"
+                    logger.error(f"mcap recover failed for {input_file.name}: {error_msg}")
+                    # Continue with other files instead of failing completely
+                    continue
+                
+                if output_file.exists():
+                    recovered_files.append(output_file)
+                    logger.info(f"Successfully recovered: {input_file.name} -> {output_filename}")
+                    
+            except subprocess.TimeoutExpired:
+                logger.error(f"Timeout recovering {input_file.name}")
+                continue
+            except Exception as e:
+                logger.error(f"Error recovering {input_file.name}: {e}")
+                continue
+
+        if not recovered_files:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            return Response({
+                "error": "No MCAP files were successfully recovered"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Create Zip archive
+        zip_filename = f"recovered_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.zip"
+        zip_path = tmp_root / zip_filename
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for rf in recovered_files:
+                zf.write(rf, arcname=rf.name)
+                logger.info(f"Added to zip: {rf.name}")
+                
+        with open(zip_path, 'rb') as f:
+            zip_data = f.read()
+            
+        # Cleanup
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        
+        logger.info(f"Created zip with {len(recovered_files)} recovered files")
+        
+        response = HttpResponse(zip_data, content_type='application/zip')
+        response['Content-Disposition'] = f'attachment; filename="{zip_filename}"'
+        response['X-Recovered-Count'] = str(len(recovered_files))
+        return response
+
     except Exception as e:
-        return Response(
-            {'error': str(e)},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-def _human_readable_size(size_bytes):
-    """Convert bytes to human readable string."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.2f} PB"
+        if tmp_root.exists():
+            shutil.rmtree(tmp_root, ignore_errors=True)
+        logger.error(f"Unexpected error in recover_and_zip: {e}")
+        return Response({
+            "error": str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
